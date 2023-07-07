@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Submits JupyterLab job to remote host's grid engine and activates JupyterLab
+# Gesine Cauer
+# For bugs: https://github.com/gesinecauer/start_jupyter/issues
+
+set -o pipefail  # If any command in pipeline returns non-zero status, pipeline returns non-zero status
+
+# ==== Usage info (ssh_jupyter -help)
+help_info="USAGE: ssh_jupyter [options]
+  [-help]               Print this help.
+  [-remote remote]      The remote host on which to start jupyter
+                        (default='grid'). Please make sure '~/.ssh/config' is
+                        set appropriately.
+  [-port port]          Select port on which to run JupyterLab (default=7777).
+  [-@ file]             Read qsub commandline input from file (default=
+                        '<remote-host>:~/.run_jupyter.qsub_option_defaults').
+  [-o path_list]        Specify standard output stream path(s).
+                        (default='<remote-host>:~/jupyter_stdout/'). Note
+                        that standard error will also be directed here.
+  [-N name]             Specify job name. (default='JUPYTER'). Note that
+                        arguments from '-l', '-pe', and '-P' options will be
+                        appended to job name. Options read from '-@ <file>' will
+                        NOT be appended to job name. If a job with the same full
+                        name (including added information from '-l', '-pe', and
+                        '-P') already exists, a new job will not be created.
+  [<qsub options> ...]  Set other qsub option(s), see \`qsub -help' for details.
+                        Default runtime is 9 hours, but can be overwritten.
+                        Note that '-b yes -terse -j yes' is always used and
+                        cannot be overwritten. Additionally, the '-e' option
+                        should not be used, as standard error will be redirected
+                        to standard output. Lastly, the order of '-ac', '-dc',
+                        and '-sc' options may not be preserved.
+
+To allow for JupyterLab-specific commands in shell configuration files, the
+variable 'currently_running' will be set to 'jupyter' when sshing to the cluster
+node running JupyterLab."
+if [[ "${1-}" =~ ^((-{1,2})[Hh][Ee][Ll][Pp])$ ]]; then
+  printf "$help_info\n"
+  exit 1
+fi
+
+# ==== Defaults
+remote='grid'  # Remote host on which to submit run_jupyter
+declare -a run_jupyter_opt  # Options to be passed to run_jupyter
+
+# ==== Regex for valid grid engine options (besides '-j', '-b', and '-terse')
+qsub_multi="\-(l|ac|dc|sc)"  # Can input multiple options for these
+qsub_single="\-(a|adds|ar|A|binding|c|ckpt|clearp|clears|C|dl|hold_jid|hold_jid_ad|i|jc|js|jsv|m|mods|masterl|masterq|mbind|now|M|N|o|P|p|par|pe|pty|q|R|r|rou|rdi|shell|si|sync|S|t|tc|tcon|umask|v|w|wd|xdv|xd|xd_run_as_image_user|@)"
+qsub_none="\-(clear|cwd|h|hard|notify|soft|verify|V)"
+
+# ==== Parse command line options
+# Prevents the annoyance of sending bad options to run_jupyter on remote host
+while [[ $# -gt 0 ]]; do
+    opt="$1"
+    shift;
+    if grep -qE "$qsub_none" <<<"$opt"; then  # Valid qsub option, 0 args
+        run_jupyter_opt+=( "$opt" )  # And do not shift to next item
+    else
+        if [[ "$1" =~ ^-..* ]]; then
+          echo "WARNING: You may have left an argument blank, check your command." >&2
+        fi
+        if [[ "$opt" == '-remote' ]]; then
+            remote="$1"
+        elif [[ "$opt" == '-port' ]]; then
+            run_jupyter_opt+=( "$opt" "$1" )
+        elif grep -qE "$qsub_multi" <<<"$opt"; then  # Valid qsub option, 1+ arg
+            run_jupyter_opt+=( "$opt" "$1" )
+        elif [[ "$opt" == '-pe' ]]; then  # -pe can have spaces in argument
+            pe_arg="$1"
+            while [[ $# -gt 1 ]] && [[ "$2" =~ ^[^-] ]]; do
+                shift;
+                pe_arg="$pe_arg $1"
+            done
+            run_jupyter_opt+=( "$opt" "$pe_arg" )
+        elif grep -qE "$qsub_single" <<<"$opt"; then  # Valid qsub option, 1 arg
+            run_jupyter_opt+=( "$opt" "$1" )
+        else
+            printf "ERROR: Invalid option: '$opt'\n$help_info\n" >&2
+            exit 1
+        fi
+        shift;
+    fi
+done
+
+# ==== Make sure we aren't running this script from the remote
+if [[ $( hostname ) == *"$remote"* ]]; then
+    echo "ERROR: This script must be run from your local machine, not $remote." >&2
+    exit 1
+fi
+
+# ==== Collect run_jupyter options
+options=$(IFS=' ' ; echo "${run_jupyter_opt[*]}")  # Join array with ' ' as delimiter
+
+# ==== Start JupyterLab: ssh to remote, submit JupyterLab job, get info, exit
+# Sourcing ~/.bash_profile in case that's where run_jupyter was added to PATH
+echo "Submitting JupyterLab job on $remote, please wait..."
+remote_cmd="[ -f ~/.bash_profile ] && source ~/.bash_profile; run_jupyter $options"
+output=$( ssh -Y $remote "$remote_cmd" 2>&1 )
+
+# ==== Parse output from starting JupyterLab job
+if ! printf "$output" | grep -qE $'^NODE:\t'; then
+    printf "\nERROR: unable to find node for JupyterLab job!\n" >&2
+    printf "       recieved the following output from remote host:\n" >&2
+    printf "======================================================\n" >&2
+    printf "\n$output\n" >&2
+    exit 1
+fi
+url=$( printf "$output" | awk -F '\t' '{if ($1 == "URL:") { print $2 }}' )
+port=$( printf "$output" | awk -F '\t' '{if ($1 == "PORT:") { print $2 }}' )
+node=$( printf "$output" | awk -F '\t' '{if ($1 == "NODE:") { print $2 }}' )
+jobid=$( printf "$output" | awk -F '\t' '{if ($1 == "JOB_ID:") { print $2 }}' )
+printf "\nURL:\t$url\nNODE:\t$node\nPORT:\t$port\nJOB_ID:\t$jobid\n"
+
+# ==== Finally, ssh back in to remote at the given port & node
+# NOTE: To allow for JupyterLab-specific commands in shell configuration files,
+# the variable 'currently_running' will be set to 'jupyter' when sshing to the
+# cluster node running JupyterLab
+printf "\nNow sshing to the cluster node running JupyterLab...\n"
+cmd='export currently_running=jupyter; bash --login'
+eval "ssh -L $port:$node:$port -tt $remote '$cmd'" 2> /dev/null

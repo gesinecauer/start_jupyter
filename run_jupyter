@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# Submits JupyterLab job to grid engine
+# Gesine Cauer
+# For bugs: https://github.com/gesinecauer/start_jupyter/issues
+
+set -eo pipefail  # Exit if any command returns non-zero status
+
+# ==== Usage info (run_jupyter -help)
+help_info="USAGE: run_jupyter [options]
+  [-help]               Print this help.
+  [-port port]          Select port on which to run JupyterLab (default=7777)
+  [-@ file]             Read qsub commandline input from file.
+                        (default='~/.run_jupyter.qsub_option_defaults')
+  [-o path_list]        Specify standard output stream path(s)
+                        (default='~/jupyter_stdout/'). Note that standard error
+                        will also be directed here.
+  [-N name]             Specify job name. (default='JUPYTER'). Note that
+                        arguments from '-l', '-pe', and '-P' options will be
+                        appended to job name. Options read from '-@ <file>' will
+                        NOT be appended to job name. If a job with the same full
+                        name (including added information from '-l', '-pe', and
+                        '-P') already exists, a new job will not be created.
+  [<qsub options> ...]  Set other qsub option(s), see \`qsub -help' for details.
+                        Default runtime is 9 hours, but can be overwritten.
+                        Note that '-b yes -terse -j yes' is always used and
+                        cannot be overwritten.  Additionally, the '-e' option
+                        should not be used, as standard error will be redirected
+                        to standard output. Lastly, the order of '-ac', '-dc',
+                        and '-sc' options may not be preserved."
+if [[ "${1-}" =~ ^((-{1,2})[Hh][Ee][Ll][Pp])$ ]]; then
+  printf "$help_info\n"
+  exit 1
+fi
+
+# ==== Function: check for item in array (compatible with bash version < 4.3)
+# Code shamelessly lifted from https://stackoverflow.com/a/13219811
+item_in_array() {
+    eval 'local keys=${!'$2'[@]}';
+    eval "case '$1' in
+        ${keys// /|}) return 0 ;;
+        * ) return 1 ;;
+      esac";
+}
+
+# ==== Defaults
+# NOTE: Always using '-b yes -terse -j yes'. These are the only options that
+#       can't be overwritten.
+# NOTE: Will request '-l h_rt=9:0:0' (9 hours) by default, can be overridden by
+#       setting h_rt with -l on command line or in optionsfile (-@ optionsfile).
+port=7777
+declare -A ge_opt_arr  # Make associative array to store grid engine options
+declare -a ge_opt_order  # Keys for ge_opt_arr, in order of creation
+ge_opt_arr['-N']='JUPYTER'  # Some grid engine options will be added to name
+ge_opt_arr['-o']="$HOME/jupyter_stdout/"  # Std err will be merged into std out
+ge_opt_arr['-@']="$HOME/.run_jupyter.qsub_option_defaults"
+ge_opt_order+=( '-N' '-o' '-@' )
+
+# ==== Regex for valid grid engine options (besides '-j', '-b', and '-terse')
+qsub_multi="\-(l|ac|dc|sc)"  # Can input multiple args for these options
+qsub_single="\-(a|adds|ar|A|binding|c|ckpt|clearp|clears|C|dl|hold_jid|hold_jid_ad|i|jc|js|jsv|m|mods|masterl|masterq|mbind|now|M|N|o|P|p|par|pe|pty|q|R|r|rou|rdi|shell|si|sync|S|t|tc|tcon|umask|v|w|wd|xdv|xd|xd_run_as_image_user|@)"
+qsub_none="\-(clear|cwd|h|hard|notify|soft|verify|V)"
+
+# ==== Parse command line options
+while [[ $# -gt 0 ]]; do
+    opt="$1"
+    shift;
+    if grep -qE "$qsub_none" <<<"$opt"; then  # Valid qsub option, 0 args
+        ge_opt_arr["$opt"]=""  # And do not shift to next item
+    else
+        if [[ "$1" =~ ^-..* ]]; then
+          echo "WARNING: You may have left an argument blank, check your command." >&2
+        fi
+        if [[ "$opt" == '-remote' ]]; then
+            :  # Ignore the '-remote' option, it's for ssh_jupyter script only
+        elif [[ "$opt" == '-port' ]]; then
+            port="$1"
+        elif grep -qE "$qsub_multi" <<<"$opt"; then  # Valid qsub option, 1+ arg
+            if item_in_array "$opt" ge_opt_arr; then
+                ge_opt_arr["$opt"]="${ge_opt_arr[$opt]},$1"
+            else
+                ge_opt_arr["$opt"]="$1"
+            fi
+        elif [[ "$opt" == '-pe' ]]; then  # -pe can have spaces in argument
+            ge_opt_arr["$opt"]="$1"
+            while [[ $# -gt 1 ]] && [[ "$2" =~ ^[^-] ]]; do
+                shift;
+                ge_opt_arr["$opt"]="${ge_opt_arr[$opt]} $1"
+            done
+        elif grep -qE "$qsub_single" <<<"$opt"; then  # Valid qsub option, 1 arg
+            ge_opt_arr["$opt"]="$1"
+        else
+            printf "ERROR: Invalid option: '$opt'\n$help_info\n" >&2
+            exit 1
+        fi
+        shift;
+    fi
+    ge_opt_order+=( "$opt" )
+done
+
+# ==== Make sure directory for grid engine stdout exists
+if [ ! -e "${ge_opt_arr['-o']}" ]; then
+    if [[ "${ge_opt_arr['-o']}" == *'/' ]]; then  # Stdout path is a directory
+        mkdir -p "${ge_opt_arr['-o']}"
+    else
+        mkdir -p $( dirname "${ge_opt_arr['-o']}" )
+    fi
+fi
+
+# ==== Check for default grid engine options file
+if [[ "${ge_opt_arr['-@']}" == "$HOME/.run_jupyter.qsub_option_defaults" ]]; then
+    if [ -f "$HOME/.run_jupyter.qsub_option_defaults" ]; then
+        nlines=$( grep "[^ ]" "$HOME/.run_jupyter.qsub_option_defaults" | \
+                 grep -v '^ *#' | wc -l )
+        if [ "$nlines" -lt 1 ]; then
+            unset ge_opt_arr['-@']
+        fi
+    else
+        unset ge_opt_arr['-@']
+    fi
+elif [ ! -e "$HOME/.run_jupyter.qsub_option_defaults" ]; then
+    echo "# Created by 'run_jupyter' script." > "$HOME/.run_jupyter.qsub_option_defaults"
+    printf "# Add desired default grid engine options for 'run_jupyter' below:\n\n" >> "$HOME/.run_jupyter.qsub_option_defaults"
+fi
+
+# === Set default runtime limit: h_rt=9:0:0 (9 hours)
+missing_runtime_limit=true
+if item_in_array "-@" ge_opt_arr; then
+    if grep -qE "(^ *[^#].*|^ *)-l +.*h_rt=[0-9:]+" "${ge_opt_arr['-@']}"; then
+        missing_runtime_limit=false
+    fi
+fi
+if item_in_array "-l" ge_opt_arr; then
+    if grep -qE "h_rt=[0-9:]+" <<<"${ge_opt_arr['-l']}"; then
+        missing_runtime_limit=false
+    fi
+fi
+if $missing_runtime_limit; then
+    if item_in_array "-l" ge_opt_arr; then
+        ge_opt_arr["-l"]="${ge_opt_arr['-l']},h_rt=9:0:0"
+    else
+        ge_opt_arr["-l"]="h_rt=9:0:0"
+        ge_opt_order+=( "-l" )
+    fi
+fi
+
+# ==== Append info from various grid engine options (-l, -pe, -P) to job name
+# NOTE: Options read from '-@ <file>' will NOT be appended to job name.
+# About grid engine job names, from 'qsub' & 'sge types' manpages:
+#   The name may be any arbitrary alphanumeric ASCII string, but may not contain
+#   "\n", "\t", "\r", "/", ":", "@", "\", "*", or "?".
+# Unallowed characters get replaced with "." and spaces get replaced with "_"
+# The runtime (h_rt=days:hours:minutes:seconds) syntax is abbreviated.
+# All arguments are delimited by ','.
+declare -a arg_desc
+if item_in_array "-l" ge_opt_arr; then
+    if tr ',' '\n' <<<"${ge_opt_arr['-l']}" | grep -q '^h_rt='; then
+        h_rt=$( tr ',' '\n' <<<"${ge_opt_arr['-l']}" | grep '^h_rt=' | tail -n 1 )
+        n_vals=$( tr ':' '\n' <<<"$h_rt" | wc -l )
+        h_rt=$( paste -d '' \
+               <( tr ':' '\n' <<<"$h_rt" | sed 's/h_rt=//;s/^0*//' ) \
+               <( printf "d\nh\nm\ns\n" | tail -n "$n_vals" ) | grep '[0-9]' )
+        l_other=$( tr ',' '\n' <<<"${ge_opt_arr['-l']}" | grep -v '^h_rt=' | \
+                  tr '\n' ',' | sed 's/,$//' )
+        if [ -z "$l_other" ]; then  # Is null
+            arg_desc+=( "${h_rt//$'\n'/}" )  # Remove \n in $h_rt
+        else
+            arg_desc+=( "${h_rt//$'\n'/}" "$l_other" )  # Remove \n in $h_rt
+        fi
+    else
+        arg_desc+=( "${ge_opt_arr['-l']}" )
+    fi
+fi
+if item_in_array "-pe" ge_opt_arr; then
+    if ! grep -q '^ *serial  *1 *$' <<<"${ge_opt_arr['-pe']}"; then
+        arg_desc+=( "${ge_opt_arr['-pe']}" )
+    fi
+fi
+if item_in_array "-P" ge_opt_arr; then
+    arg_desc+=( "${ge_opt_arr['-P']}" )
+fi
+arg_desc=$(IFS=, ; echo "${arg_desc[*]}")  # Join array with ',' as delimiter
+arg_desc=$( sed -r 's/[:@\*?//]/./g' <<<"${arg_desc}" | tr '\n' '.' | \
+           tr '\t' '.' | tr '\r' '.' | tr '/' '.' | tr ' ' '_' |
+           sed -r 's/^[,.]*([^.,].+)/\1/;s/(.+[^.,])[,.]*$/\1/' )
+jobname="${ge_opt_arr['-N']}.${arg_desc}"
+ge_opt_arr['-N']="${jobname}"
+
+# ==== Combine together grid engine options from associative array
+ge_options="-b yes -terse -j yes"  # These are always included
+for opt in "${ge_opt_order[@]}"; do
+    if ! item_in_array "$opt" ge_opt_arr; then
+        continue
+    elif [ -z "${ge_opt_arr[${opt}]}" ]; then  # Is null
+        ge_options="${ge_options} ${opt}"  # Option does not have args
+    # elif [[ "$opt" == "-o" ]] || [[ "$opt" == "-@" ]]; then
+    #     ge_options="${ge_options} ${opt} '${ge_opt_arr[${opt}]}'"  # Quoted
+    else
+        ge_options="${ge_options} ${opt} ${ge_opt_arr[${opt}]}"
+    fi
+done
+
+# ==== Get username
+username=$( whoami )
+
+# ==== If there's no JupyterLab job with the given name, create one
+if ! qstat -u "$username" | grep -qE " $jobname +$username"; then
+    if [ -f "${ge_opt_arr['-o']}" ]; then  # Delete preexisting stdout file
+        rm "${ge_opt_arr['-o']}"
+    fi
+    jobid=$( qsub $ge_options "[ -f ~/.bash_profile ] && source ~/.bash_profile; jupyter lab "'--ip=$(hostname)'" --port=$port --no-browser" ) || ( \
+        printf "ERROR: Could not submit JupyterLab job for '$jobname'\n" >&2 && exit 1 )
+    printf "Submitted JupyterLab job: name='$jobname', job_id=$jobid\n"
+fi
+
+# ==== If there are >1 current JupyterLab jobs, exit
+if qstat -u "$username" | grep -qE " $jobname +$username"; then
+    njobs=$( qstat -u "$username" | grep -E " $jobname +$username" | wc -l )
+    if [ "$njobs" -gt 1 ]; then
+        echo "There are $njobs '$jobname' jobs, but there should only be 1:"
+        qstat -u "$username" | grep -E " $jobname +$username"
+        exit 1
+    fi
+fi
+
+# ==== If JupyterLab job hasn't started running yet, wait up to 1 minute
+if ! qstat -u "$username" | grep -qE " $jobname +$username +r +"; then
+    printf "Waiting for '$jobname' job to start running..."
+    for i in $( seq 40 ); do
+        if ! qstat -u "$username" | grep -qE " $jobname +$username"; then
+            printf "\n'$jobname' job quit unexpectedly\n"
+            exit 1
+        fi
+        if ! qstat -u "$username" | grep -qE " $jobname +$username +r +"; then
+            printf '.'
+            sleep 1.5
+        else
+            break
+        fi
+    done
+    echo  # End the current line of '....'
+fi
+
+# ==== If there still isn't a JupyterLab job running, exit
+if ! qstat -u "$username" | grep -qE " $jobname +$username"; then
+    echo "'$jobname' job quit unexpectedly"
+    exit 1
+fi
+if ! qstat -u "$username" | grep -qE " $jobname +$username +r +"; then
+    echo "No '$jobname' jobs currently running."
+    echo "Current '$jobname' job(s):"
+    qstat -u "$username" | grep -E " $jobname +$username"
+    exit 2
+fi
+
+# ==== Locate grid engine standard output file for this job
+jobid=$( qstat -u "$username" | grep -E " $jobname +$username +r +" | \
+        awk '{ print $1 }' )
+stdout=$( qstat -u "$username" -j "$jobid" | \
+         awk '{ if ($1 == "stdout_path_list:") { gsub(/.+\:/,"",$2); print $2 }}' )
+if [[ "$stdout" == *'/' ]]; then  # Stdout path is a directory
+    mkdir -p "${ge_opt_arr['-o']}"
+    stdout="$stdout$jobname.o$jobid"
+fi
+
+# ==== Wait (up to 1 minute) for JupyterLab application to load
+if [ ! -f "$stdout" ] || [ $( cat "$stdout" | wc -l ) -lt 1 ]; then
+    printf "Waiting for JupyterLab to load..."
+    for i in $( seq 40 ); do
+        if [ ! -f "$stdout" ]; then
+            printf '.'
+            sleep 1.5
+        elif ! grep -qE '^.+\] +(or +){0,1}https{0,1}://' "$stdout"; then
+            printf '.'
+            sleep 1.5
+        else
+            break
+        fi
+    done
+    echo  # End the current line of '....'
+fi
+
+# ==== If JupyterLab application hasn't loaded yet, exit
+if [ ! -f "$stdout" ]; then
+    echo "JupyterLab application not yet loaded: '$stdout' does not exist."
+    exit 2
+elif [ $( cat "$stdout" | wc -l ) -lt 1 ]; then
+    echo "JupyterLab application not yet loaded: '$stdout' is empty."
+    exit 2
+elif ! grep -qE '^.+\] +(or +){0,1}https{0,1}://' "$stdout"; then
+    echo "JupyterLab application not yet loaded, please try again in a moment."
+    exit 2
+fi
+
+# ==== Print job_id, port, node, url, and ssh command
+node=$( qstat -u "$username" | grep -E " $jobname +$username" | \
+       awk '{ print $8 }' | sed -r "s/.+\@([a-z]+[0-9]+)\..*/\1/" )
+url=$( grep -E '^.+\] +(or +){0,1}https{0,1}://' "$stdout" | tail -n 1 | \
+      sed -r 's/^.+\] +(or +){0,1}//' )
+printf "\nJOB_ID:\t$jobid\nPORT:\t$port\nNODE:\t$node\nURL:\t$url/\n\n"
+echo "To activate, run the following command from your local machine:"
+echo "\`ssh -L $port:$node:$port $username@<remote-host>'"
